@@ -2,11 +2,12 @@
 Wave Field LLM - Physics-Based Language Model with Wave Field Dynamics
 """
 
-__version__ = "4.3.9"
+__version__ = "4.7.0"
 
 from .global_context import GlobalContextModule
 from .wave_field_attention import WaveFieldAttention
 from .wave_field_transformer import WaveFieldTransformer, FieldInterferenceModule
+from .gla import GLALayer
 
 # Legacy V1/V2 imports (moved to src/legacy/)
 try:
@@ -21,4 +22,5 @@ __all__ = [
     "WaveFieldAttention",
     "WaveFieldTransformer",
     "FieldInterferenceModule",
+    "GLALayer",
 ]

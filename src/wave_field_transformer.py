@@ -34,6 +34,15 @@ if __name__ == '__main__':
 else:
     from .wave_field_attention import WaveFieldAttention
 
+# GLA import for hybrid architecture
+try:
+    if __name__ == '__main__':
+        from src.gla import GLALayer
+    else:
+        from .gla import GLALayer
+except ImportError:
+    GLALayer = None
+
 
 class SinusoidalPositionalEncoding(nn.Module):
     """Sinusoidal positional encoding."""
@@ -240,7 +249,9 @@ class WaveFieldTransformer(nn.Module):
                  num_basis_kernels=4,
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
-                 use_split_step=None):
+                 use_split_step=None,
+                 hybrid_attention_layers=None,
+                 gla_layers=None):
         super().__init__()
 
         self.vocab_size = vocab_size
@@ -250,6 +261,9 @@ class WaveFieldTransformer(nn.Module):
         self.use_checkpoint = use_checkpoint
         self.interference_interval = interference_interval
         self.residual_scale = residual_scale
+        self._hybrid_indices = set(hybrid_attention_layers or [])
+        self._gla_indices = set(gla_layers or [])
+        self._gla_shared_source = {}  # track which GLA layers share weights
         self.device = device if device is not None else (
             'cuda' if torch.cuda.is_available() else 'cpu'
         )
@@ -261,32 +275,57 @@ class WaveFieldTransformer(nn.Module):
         )
         self.dropout = nn.Dropout(dropout)
 
-        # Wave Field Transformer layers
-        self.layers = nn.ModuleList([
-            WaveFieldTransformerLayer(
-                embedding_dim=embedding_dim,
-                num_heads=num_heads,
-                ffn_dim=ffn_dim,
-                field_size=field_size,
-                max_seq_len=max_seq_len,
-                dropout=dropout,
-                n_components=n_components,
-                local_window=local_window,
-                use_analytic_kernel=use_analytic_kernel,
-                feature_map_depth=feature_map_depth,
-                use_write_gate=use_write_gate,
-                use_3d_interference=use_3d_interference,
-                use_kernel_mixture=use_kernel_mixture,
-                num_basis_kernels=num_basis_kernels,
-                layer_idx=layer_idx,
-                num_layers=num_layers,
-                skip_causal_enforce=skip_causal_enforce,
-                n_frozen_heads=n_frozen_heads,
-                use_split_step=use_split_step,
-                device=self.device
-            )
-            for layer_idx in range(num_layers)
-        ])
+        # V5.0: Hybrid layer construction — wave field for most layers,
+        # standard attention for layers in hybrid_attention_layers,
+        # GLA layers for layers in gla_layers (with Zamba2 weight sharing).
+        self.layers = nn.ModuleList()
+        self._gla_source_layer = None
+        for layer_idx in range(num_layers):
+            if layer_idx in self._gla_indices:
+                if GLALayer is None:
+                    raise ImportError("GLALayer not available — check src/gla.py")
+                if self._gla_source_layer is None:
+                    gla = GLALayer(
+                        d_model=embedding_dim,
+                        num_heads=num_heads,
+                        ffn_dim=ffn_dim,
+                        dropout=dropout,
+                    )
+                    self._gla_source_layer = gla
+                    self.layers.append(gla)
+                else:
+                    # Weight sharing: subsequent GLA layers reuse the first
+                    self.layers.append(self._gla_source_layer)
+                    self._gla_shared_source[layer_idx] = True
+            elif layer_idx in self._hybrid_indices:
+                self.layers.append(nn.TransformerEncoderLayer(
+                    d_model=embedding_dim, nhead=num_heads,
+                    dim_feedforward=ffn_dim, dropout=dropout,
+                    activation='gelu', batch_first=True, norm_first=True
+                ))
+            else:
+                self.layers.append(WaveFieldTransformerLayer(
+                    embedding_dim=embedding_dim,
+                    num_heads=num_heads,
+                    ffn_dim=ffn_dim,
+                    field_size=field_size,
+                    max_seq_len=max_seq_len,
+                    dropout=dropout,
+                    n_components=n_components,
+                    local_window=local_window,
+                    use_analytic_kernel=use_analytic_kernel,
+                    feature_map_depth=feature_map_depth,
+                    use_write_gate=use_write_gate,
+                    use_3d_interference=use_3d_interference,
+                    use_kernel_mixture=use_kernel_mixture,
+                    num_basis_kernels=num_basis_kernels,
+                    layer_idx=layer_idx,
+                    num_layers=num_layers,
+                    skip_causal_enforce=skip_causal_enforce,
+                    n_frozen_heads=n_frozen_heads,
+                    use_split_step=use_split_step,
+                    device=self.device
+                ))
         
         # Field Interference modules (inserted periodically)
         # V3.3: diverse temperatures — sharp early (binary decisions),
@@ -320,12 +359,14 @@ class WaveFieldTransformer(nn.Module):
                 torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
         # Re-apply attention-specific initialization that the generic
-        # init above overwrites.
+        # init above overwrites. Skip standard attention layers (V5.0 hybrid).
         H = self.num_heads
         D = self.embedding_dim
         head_dim = D // H
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if i in self._hybrid_indices or i in self._gla_indices:
+                continue  # nn.TransformerEncoderLayer / GLALayer handle their own init
             attn = layer.attention
 
             with torch.no_grad():
@@ -340,6 +381,9 @@ class WaveFieldTransformer(nn.Module):
                         if isinstance(module, nn.Linear):
                             nn.init.eye_(module.weight)
                             nn.init.zeros_(module.bias)
+
+                # V4.5.0: Cross-dim mixing — restore identity init
+                nn.init.eye_(attn.cross_dim.weight)
 
                 # Spectral gate: restore small-but-meaningful init (skip if kernel mixture)
                 # V4.3.4: 20x larger (was 0.001). Combined with 50x LR + no weight decay,
@@ -367,7 +411,9 @@ class WaveFieldTransformer(nn.Module):
         # to stabilize deep networks (GPT-style 1/sqrt(2*num_layers)).
         if self.residual_scale:
             scale = (2 * len(self.layers)) ** -0.5
-            for layer in self.layers:
+            for i, layer in enumerate(self.layers):
+                if i in self._hybrid_indices or i in self._gla_indices:
+                    continue  # standard / GLA layer has its own scaling
                 with torch.no_grad():
                     layer.attention.out_proj.weight.mul_(scale)
                     layer.ffn[3].weight.mul_(scale)  # second Linear in FFN
@@ -423,7 +469,15 @@ class WaveFieldTransformer(nn.Module):
         if not hasattr(torch, 'compile'):
             return self
 
-        for layer in self.layers:
+        for i, layer in enumerate(self.layers):
+            if i in self._gla_indices:
+                if i not in self._gla_shared_source:
+                    self.layers[i] = torch.compile(layer, mode=mode)
+                continue
+            if i in self._hybrid_indices:
+                # Standard TransformerEncoderLayer — compile the whole thing
+                self.layers[i] = torch.compile(layer, mode=mode)
+                continue
             layer.ffn = torch.compile(layer.ffn, mode=mode)
             layer.norm1 = torch.compile(layer.norm1, mode=mode)
             layer.norm2 = torch.compile(layer.norm2, mode=mode)
@@ -457,16 +511,42 @@ class WaveFieldTransformer(nn.Module):
         x = x + pos_enc.unsqueeze(0)
         x = self.dropout(x)
         
-        # Wave Field layers with interference
+        # Wave Field layers with interference (V5.0: hybrid-aware, V4.7: GLA-aware)
         interference_idx = 0
+        causal_mask = None  # lazily built for standard attention layers
         for i, layer in enumerate(self.layers):
-            if self.use_checkpoint and self.training:
-                x = torch.utils.checkpoint.checkpoint(
-                    layer, x, mask, use_reentrant=False
-                )
+            is_hybrid = i in self._hybrid_indices
+            is_gla = i in self._gla_indices
+            if is_hybrid:
+                # Standard nn.TransformerEncoderLayer — needs causal mask
+                if causal_mask is None or causal_mask.shape[0] != N:
+                    causal_mask = nn.Transformer.generate_square_subsequent_mask(
+                        N, device=x.device, dtype=x.dtype
+                    )
+                if self.use_checkpoint and self.training:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer, x, causal_mask, None, True,
+                        use_reentrant=False
+                    )
+                else:
+                    x = layer(x, src_mask=causal_mask, is_causal=True)
+            elif is_gla:
+                # GLALayer — causal by construction, no mask needed
+                if self.use_checkpoint and self.training:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer, x, use_reentrant=False
+                    )
+                else:
+                    x = layer(x)
             else:
-                x = layer(x, mask)
-            
+                # WaveFieldTransformerLayer — causality enforced via FFT
+                if self.use_checkpoint and self.training:
+                    x = torch.utils.checkpoint.checkpoint(
+                        layer, x, mask, use_reentrant=False
+                    )
+                else:
+                    x = layer(x, mask)
+
             # Apply field interference periodically
             if ((i + 1) % self.interference_interval == 0 and
                     interference_idx < len(self.interference_modules)):
