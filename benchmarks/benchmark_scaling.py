@@ -371,6 +371,12 @@ def create_wave_model(vocab_size, cfg, device):
     local_window = int(os.environ.get('LOCAL_WINDOW', '') or '0')
     n_frozen_heads = int(os.environ.get('FROZEN_HEADS', '') or '0')
     use_split_step = os.environ.get('SPLIT_STEP', '') == '1'
+    # V5.0: Hybrid attention — replace specific layers with standard attention
+    hybrid_layers_str = os.environ.get('HYBRID_LAYERS', '').strip()
+    hybrid_layers = [int(x) for x in hybrid_layers_str.split(',') if x.strip().isdigit()]
+    # V4.7: GLA layers — replace specific layers with Gated Linear Attention
+    gla_layers_str = os.environ.get('GLA_LAYERS', '').strip()
+    gla_layers = [int(x) for x in gla_layers_str.split(',') if x.strip().isdigit()]
     model = WaveFieldTransformer(
         vocab_size=vocab_size,
         embedding_dim=cfg['embedding_dim'],
@@ -386,11 +392,15 @@ def create_wave_model(vocab_size, cfg, device):
         local_window=local_window,
         n_frozen_heads=n_frozen_heads,
         use_split_step=use_split_step,
+        hybrid_attention_layers=hybrid_layers if hybrid_layers else None,
+        gla_layers=gla_layers if gla_layers else None,
         device=device,
     ).to(device)
-    if local_window > 0 or n_frozen_heads > 0:
+    if local_window > 0 or n_frozen_heads > 0 or hybrid_layers or gla_layers:
         print(f"  Wave config: local_window={local_window}, "
-              f"n_frozen_heads={n_frozen_heads}")
+              f"n_frozen_heads={n_frozen_heads}, "
+              f"hybrid_layers={hybrid_layers or 'none'}, "
+              f"gla_layers={gla_layers or 'none'}")
     return model
 
 
@@ -524,7 +534,10 @@ def train_run(model, train_data, val_data, vocab_size, device, run_name,
         optimizer = model.configure_optimizer(base_lr=peak_lr, kernel_lr_mult=50.0)
     else:
         optimizer = torch.optim.AdamW(model.parameters(), lr=peak_lr, weight_decay=0.01, eps=1e-8)
-    warmup = max(total_steps // 10, 100)
+    # V4.5.0: 20% warmup (was 10%). Kernel params (50x LR) destabilize during
+    # ramp-up — steps 122-244 show near-zero loss improvement. Longer warmup
+    # gives kernel params more time at low LR to stabilize before peak.
+    warmup = max(total_steps // 5, 200)
     scheduler = WarmupCosineScheduler(optimizer, warmup, total_steps)
     scaler = torch.amp.GradScaler('cuda', enabled=use_amp)
 

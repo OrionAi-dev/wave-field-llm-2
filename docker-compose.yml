@@ -20,6 +20,72 @@ services:
       - SCALE=S1
       - DATASET=2
 
+  # S1+H1: 22M params, 20M tokens, local_window=64 (~25 min on 3060)
+  s1-h1:
+    build: .
+    container_name: wave-s1-h1
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1
+      - DATASET=2
+      - LOCAL_WINDOW=64
+
+  # S1-Hybrid: V5.0 hybrid — 1 standard attention layer at L3 (~25 min on 3060)
+  s1-hybrid:
+    build: .
+    container_name: wave-s1-hybrid
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1
+      - DATASET=2
+      - HYBRID_LAYERS=3
+
+  # S1+GLA: 22M params, 20M tokens, GLA at L3+L7 with weight sharing (~25 min)
+  s1-gla:
+    build: .
+    container_name: wave-s1-gla
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=benchmarks/benchmark_scaling.py
+      - SCALE=S1
+      - DATASET=2
+      - GLA_LAYERS=3,7
+
   # S2: 55M params, 50M tokens (~2.3 hrs on 3060)
   s2:
     build: .
@@ -219,6 +285,47 @@ services:
       - CONFIGS=W4K,S4K
       - FROZEN_HEADS=4
       - TOKEN_BUDGET=20000000
+
+  # Battle Plan: E0+F1 quick (~20 min per pair)
+  battle-quick:
+    build: .
+    container_name: wave-battle-quick
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+      - BENCHMARK=scripts/battle_plan.py
+      - BATTLE_EXP=F2,H1,C1
+      - BATTLE_TOKENS=10000000
+    command: ["sh", "-c", "python -u scripts/battle_plan.py --exp $${BATTLE_EXP:-F2,H1,C1} --token-budget $${BATTLE_TOKENS:-10000000}"]
+
+  # Battle Plan: All experiments (~2 hrs)
+  battle-all:
+    build: .
+    container_name: wave-battle-all
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: 1
+              capabilities: [gpu]
+    volumes:
+      - ./results:/app/results
+      - data-cache:/app/.cache
+    environment:
+      - NVIDIA_VISIBLE_DEVICES=all
+      - HF_HOME=/app/.cache/huggingface
+    command: ["sh", "-c", "python -u scripts/battle_plan.py --exp ALL --token-budget 10000000"]
 
   # V4.3 benchmark (original 5M token comparison)
   v43:

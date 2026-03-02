@@ -59,7 +59,7 @@ case "$SERVICE" in
     echo -e "${GREEN}Done.${NC}"
     exit 0
     ;;
-  s1|s2|s3|v43|lc-2k|lc-4k|lc-sweet|exp-a|exp-a-512|exp-a-2k|exp-a-4k)
+  s1|s1-h1|s1-hybrid|s1-gla|s2|s3|v43|lc-2k|lc-4k|lc-sweet|exp-a|exp-a-512|exp-a-2k|exp-a-4k|battle-quick|battle-all)
     # Get version for results tagging
     VERSION=$(python -c "import sys; sys.path.insert(0,'.'); from src import __version__; print(__version__)" 2>/dev/null || echo "unknown")
     echo -e "\n${YELLOW}[version]${NC} v${VERSION}"
@@ -97,6 +97,9 @@ case "$SERVICE" in
     echo "  lc-2k      2K seq only (~15 min)"
     echo "  lc-4k      4K seq only (~20 min)"
     echo "  s1         S1 scaling 22M params (~25 min)"
+    echo "  s1-h1      S1 + local_window=64 (~25 min)"
+    echo "  s1-hybrid  S1 + hybrid (1 std attn layer at L3) (~25 min)"
+    echo "  s1-gla     S1 + GLA at L3,L7 (~25 min)"
     echo "  s2         S2 scaling 55M params (~2.3 hrs)"
     echo "  s3         S3 scaling 100M params (~9 hrs)"
     echo "  v43        V4.3 benchmark (5M tokens)"
@@ -104,6 +107,8 @@ case "$SERVICE" in
     echo "  exp-a-512  Exp A: seq=512 pair only (~25 min)"
     echo "  exp-a-2k   Exp A: seq=2048 pair only (~35 min)"
     echo "  exp-a-4k   Exp A: seq=4096 pair only (~50 min)"
+    echo "  battle-quick  Battle Plan: E0+F1 (~20 min)"
+    echo "  battle-all    Battle Plan: all experiments (~2 hrs)"
     echo "  clean      Remove wave-* containers"
     echo "  nuke       Remove containers + images + volumes"
     exit 1
