@@ -547,7 +547,6 @@ def main():
                     dropout=0.1,
                 ).to(device)
             else:
-                local_window = int(os.environ.get('LOCAL_WINDOW', '') or '0')
                 n_frozen_heads = int(os.environ.get('FROZEN_HEADS', '') or '0')
                 model = WaveFieldTransformer(
                     vocab_size=vocab_size,
@@ -561,17 +560,13 @@ def main():
                     use_checkpoint=True,
                     interference_interval=3,
                     n_components=1,
-                    local_window=local_window,
                     n_frozen_heads=n_frozen_heads,
                     device=device,
                     use_analytic_kernel=True,
                     feature_map_depth=2,
-                    use_write_gate=False,
-                    use_3d_interference=False,
                 ).to(device)
-                if local_window > 0 or n_frozen_heads > 0:
-                    print(f"  Wave config: local_window={local_window}, "
-                          f"n_frozen_heads={n_frozen_heads}")
+                if n_frozen_heads > 0:
+                    print(f"  Wave config: n_frozen_heads={n_frozen_heads}")
 
             n_params = sum(p.numel() for p in model.parameters())
             # torch.compile: skip for S2 scale — 10-20 min compile overhead
@@ -623,7 +618,6 @@ def main():
         'version': os.environ.get('RESULTS_VERSION', 'unknown'),
         'arch': ARCH,
         'frozen_heads': int(os.environ.get('FROZEN_HEADS', '') or '0'),
-        'local_window': int(os.environ.get('LOCAL_WINDOW', '') or '0'),
         'token_budget': os.environ.get('TOKEN_BUDGET', str(ARCH['token_budget'])),
         'dataset': os.environ.get('DATASET', '103'),
     }

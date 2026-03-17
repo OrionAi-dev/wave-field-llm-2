@@ -276,7 +276,6 @@ def main():
             use_checkpoint=True,
             interference_interval=3,
             n_components=1,
-            local_window=0,
             device=dev,
         ).to(dev)
 

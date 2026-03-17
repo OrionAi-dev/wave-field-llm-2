@@ -186,7 +186,7 @@ def create_wave_model(vocab_size, embedding_dim, num_layers, num_heads,
         ffn_dim=ffn_dim, field_size=field_size,
         max_seq_len=seq_len + 2, dropout=0.1,
         use_checkpoint=True, interference_interval=3,
-        n_components=1, local_window=0, device=device,
+        n_components=1, device=device,
     ).to(device)
 
     if disable_spectral_gate:

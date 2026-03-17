@@ -37,7 +37,6 @@ def load_model(checkpoint_path, scale_key, vocab_size, device):
         use_checkpoint=False,
         interference_interval=3,
         n_components=1,
-        local_window=0,
         device=device,
     ).to(device)
 

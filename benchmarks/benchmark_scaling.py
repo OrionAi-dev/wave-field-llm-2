@@ -368,9 +368,7 @@ def create_wave_model(vocab_size, cfg, device):
     """Create SPECTRE-Wave model for a given scale config."""
     ckpt_env = os.environ.get('USE_CHECKPOINT', '').strip().lower()
     use_ckpt = (ckpt_env != '0') if ckpt_env else cfg.get('use_checkpoint', True)
-    local_window = int(os.environ.get('LOCAL_WINDOW', '') or '0')
     n_frozen_heads = int(os.environ.get('FROZEN_HEADS', '') or '0')
-    use_split_step = os.environ.get('SPLIT_STEP', '') == '1'
     # V5.0: Hybrid attention — replace specific layers with standard attention
     hybrid_layers_str = os.environ.get('HYBRID_LAYERS', '').strip()
     hybrid_layers = [int(x) for x in hybrid_layers_str.split(',') if x.strip().isdigit()]
@@ -389,16 +387,13 @@ def create_wave_model(vocab_size, cfg, device):
         use_checkpoint=use_ckpt,
         interference_interval=3,
         n_components=1,
-        local_window=local_window,
         n_frozen_heads=n_frozen_heads,
-        use_split_step=use_split_step,
         hybrid_attention_layers=hybrid_layers if hybrid_layers else None,
         gla_layers=gla_layers if gla_layers else None,
         device=device,
     ).to(device)
-    if local_window > 0 or n_frozen_heads > 0 or hybrid_layers or gla_layers:
-        print(f"  Wave config: local_window={local_window}, "
-              f"n_frozen_heads={n_frozen_heads}, "
+    if n_frozen_heads > 0 or hybrid_layers or gla_layers:
+        print(f"  Wave config: n_frozen_heads={n_frozen_heads}, "
               f"hybrid_layers={hybrid_layers or 'none'}, "
               f"gla_layers={gla_layers or 'none'}")
     return model
@@ -1270,7 +1265,6 @@ def run_inference_test(all_results, scale_keys, vocab_size, tok, device, results
         use_checkpoint=False,
         interference_interval=3,
         n_components=1,
-        local_window=0,
         device=device,
     ).to(device)
 

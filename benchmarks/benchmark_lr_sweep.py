@@ -382,12 +382,9 @@ def main():
                 use_checkpoint=True,
                 interference_interval=3,
                 n_components=1,
-                local_window=0,
                 device=device,
                 use_analytic_kernel=True,
                 feature_map_depth=2,
-                use_write_gate=False,
-                use_3d_interference=False,
             ).to(device)
             qk_mult = cfg.get('qk_lr_mult', 3.0)
 

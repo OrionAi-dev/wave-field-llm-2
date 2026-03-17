@@ -208,13 +208,13 @@ ARCH = {
 # All Wave configs use: analytic kernel, 2-layer FM, QK LR 3x (proven V4.3).
 CONFIGS = [
     {'key': 'A', 'name': 'A) V4.3 Best (baseline)',
-     'type': 'wave', 'use_write_gate': False, 'use_3d_interference': False},
+     'type': 'wave'},
     {'key': 'B', 'name': 'B) + Write Gate (GLA-style)',
-     'type': 'wave', 'use_write_gate': True, 'use_3d_interference': False},
+     'type': 'wave'},
     {'key': 'C', 'name': 'C) + 3D Interference',
-     'type': 'wave', 'use_write_gate': False, 'use_3d_interference': True},
+     'type': 'wave'},
     {'key': 'D', 'name': 'D) + Both (Write Gate + 3D)',
-     'type': 'wave', 'use_write_gate': True, 'use_3d_interference': True},
+     'type': 'wave'},
     {'key': 'E', 'name': 'E) Standard Transformer',
      'type': 'standard'},
 ]
@@ -379,12 +379,9 @@ def main():
                 use_checkpoint=True,
                 interference_interval=3,
                 n_components=1,
-                local_window=0,
                 device=device,
                 use_analytic_kernel=True,
                 feature_map_depth=2,
-                use_write_gate=cfg.get('use_write_gate', False),
-                use_3d_interference=cfg.get('use_3d_interference', False),
             ).to(device)
 
         try:

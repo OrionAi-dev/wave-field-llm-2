@@ -1,41 +1,26 @@
 """
-Wave Field Attention V4.3 - SPECTRE-Wave Hybrid
-================================================
+Wave Field Attention V4.7
+=========================
 
-V4.1 hit PPL 543 at 15M tokens but needed 3x more data than Standard
-Transformer (PPL 473 at 5M). V4.2 init fixes gave PPL 997 at 5M — still 2x gap.
+Physics-based O(n log n) attention via damped wave kernels on continuous fields.
 
-V4.3 FIX — Three architectural changes grounded in literature:
+Each head has 3 learnable wave parameters (frequency, damping, phase).
+Tokens scatter onto a 1D field, wave kernels convolve via FFT, results gather back.
 
-  1. LEARNED FEATURE MAPS (Hedgehog, ICLR 2024):
-     Replace elu(x)+1 with Linear(head_dim) initialized as identity + ReLU.
-     At init, φ(q) ≈ ReLU(q) — every token is distinct from step 1.
-     Cost: +49K params (0.6%)
-
-  2. HiPPO KERNEL INIT (S4D, arXiv:2206.11893):
-     Uniform damping + harmonic frequencies ω_n = π(2n+1)/2.
-     Cost: Zero (just initialization)
-
-  3. CONTENT-ADAPTIVE SPECTRAL GATE (SPECTRE, arXiv:2502.18394):
-     A small MLP conditioned on mean(Q) produces per-head spectral
-     modulation of the wave kernel FFT. This makes the effective
-     attention kernel INPUT-DEPENDENT — different inputs get different
-     receptive fields. SPECTRE proved this beats standard transformers
-     (PPL 39.0 vs 39.4 on PG-19).
-
-     The MLP produces 32 control points per head, interpolated to full
-     frequency resolution (smooth, low-rank spectral gate). Initialized
-     near zero so model starts identical to base V4.3.
-     Cost: +131K params (1.6%)
+Key components:
+  - LearnedFeatureMap: identity-init MLP + ReLU (Hedgehog, ICLR 2024)
+  - SpectralGate: MLP conditioned on token 0 modulates kernel FFT per-sample
+    (SPECTRE, arXiv:2502.18394). Makes kernel input-dependent.
+  - HiPPO init: harmonic frequencies ω_n = π(2n+1)/2 (S4D, arXiv:2206.11893)
 
 Pipeline:
-  1. DEPOSIT: φ_k(K) ⊙ V  — learned K feature map modulates V
-  2. PROPAGATE: Wave convolution with CONTENT-ADAPTIVE kernel
-     (base HiPPO kernel × spectral gate conditioned on mean(Q))
-  3. GATHER: Read field at token positions
-  4. READ: φ_q(Q) ⊙ gathered  — learned Q feature map selects dims
+  1. DEPOSIT: φ_k(K) ⊙ V → scatter onto field
+  2. PROPAGATE: FFT convolution with (optionally content-adaptive) wave kernel
+  3. COUPLE: cross-head field coupling
+  4. GATHER: read field at token positions
+  5. READ: φ_q(Q) ⊙ gathered → cross-dim mixing → gating → output
 
-Complexity: O(n log n) — unchanged from V4.1
+Complexity: O(n log n) per layer
 """
 
 import torch
@@ -60,18 +45,6 @@ def _next_fast_size(n):
         if m == 1:
             return n
         n += 1
-
-
-class ELUPlus1(nn.Module):
-    """elu(x) + 1: always positive, no dead neurons, smooth gradient everywhere.
-
-    Standard activation for linear attention feature maps (Katharopoulos et al., 2020).
-    Unlike ReLU which permanently kills ~50% of neurons, ELU+1 has non-zero gradient
-    for all inputs: f'(x) = 1 for x>0, f'(x) = exp(x) for x<0.
-    """
-
-    def forward(self, x):
-        return F.elu(x) + 1.0
 
 
 class LearnedFeatureMap(nn.Module):
@@ -115,18 +88,13 @@ class LearnedFeatureMap(nn.Module):
 class SpectralGate(nn.Module):
     """Content-adaptive spectral gate (SPECTRE, arXiv:2502.18394).
 
-    A small MLP conditioned on the first query token modulates the base wave
-    kernel in frequency domain. This makes the effective attention pattern
-    input-dependent while staying O(n log n).
+    Conditioned on token 0's query vector (the only token visible to all
+    positions in a causal model). Produces per-sample spectral modulation
+    of the wave kernel FFT, making the attention pattern input-dependent
+    while staying O(n log n).
 
-    Architecture:
-      q_bar = LayerNorm(q[:, :, 0, :])       # (B, H, head_dim) — token 0 only
-      ctrl = MLP(flatten(q_bar))             # (B, H, n_control)
-      gate = interpolate(ctrl, freq_bins)    # (B, H, freq_bins) — smooth
-      modulated = base_fft * (1 + gate)      # content-adaptive kernel
-
-    CAUSALITY NOTE: Must NOT use mean(Q) over all positions — that leaks future
-    tokens into the kernel shape. Token 0 is visible to all positions, so safe.
+    Output is 3D (B, H, freq_bins) — requires causal enforcement via
+    IFFT→zero→FFT since modulation can break Kramers-Kronig.
 
     At init, MLP output ≈ 0, so modulated ≈ base kernel (safe start).
     """
@@ -185,15 +153,13 @@ class SpectralGate(nn.Module):
 class WaveFieldAttention(nn.Module):
 
     def __init__(self, embedding_dim, num_heads, field_size=512, max_seq_len=128,
-                 n_components=1, local_window=0, use_analytic_kernel=True,
-                 feature_map_depth=2, use_write_gate=True,
-                 use_3d_interference=False,
-                 use_kernel_mixture=False, num_basis_kernels=4,
+                 n_components=1, use_analytic_kernel=True,
+                 feature_map_depth=2,
                  layer_idx=0, num_layers=1,
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
                  use_monarch_fft=None,
-                 use_split_step=None,
+                 use_spectral_gate=None,
                  device='cuda'):
         super().__init__()
 
@@ -203,12 +169,7 @@ class WaveFieldAttention(nn.Module):
         self.field_size = field_size
         self.max_seq_len = max_seq_len
         self.n_components = n_components
-        self.local_window = local_window
         self.use_analytic_kernel = use_analytic_kernel
-        self.use_write_gate = use_write_gate
-        self.use_3d_interference = use_3d_interference
-        self.use_kernel_mixture = use_kernel_mixture
-        self.num_basis_kernels = num_basis_kernels
         self.layer_idx = layer_idx
         self.num_layers = num_layers
         self.skip_causal_enforce = skip_causal_enforce
@@ -225,29 +186,17 @@ class WaveFieldAttention(nn.Module):
             self.qkvg_proj.weight[3 * embedding_dim:].zero_()
             self.qkvg_proj.bias[3 * embedding_dim:].fill_(2.0)
 
-        # V4.3: Learned feature maps (Hedgehog-style, identity-init)
-        # depth=1: single Linear+ReLU (original). depth=2: 2-layer MLP (Hedgehog).
+        # Learned feature maps (Hedgehog-style, identity-init)
         self.q_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
         self.k_feature_map = LearnedFeatureMap(self.head_dim, depth=feature_map_depth)
 
-        # V4.4: Selective write gate (GLA-inspired)
-        # Controls per-token, per-head write strength to wave field.
-        # Input is raw K (mean-zero at init) → sigmoid(0) = 0.5 (neutral).
-        if use_write_gate:
-            self.write_gate_proj = nn.Linear(self.head_dim, 1, bias=True)
-
         # Pad to cuFFT-friendly size (prime factors <= 7).
-        # 4x padding (not 2x) to prevent FFT circular wraparound leaking future
-        # tokens when field_size ≈ seq_len. With 2x, fp32 precision errors in the
-        # IFFT→zero→FFT causal enforcement chain create ~1e-4 leakage at init that
-        # training amplifies to ~10 logit diffs. 4x padding gives enough zero-buffer
-        # to keep leakage at ~1e-7 (harmless). Cost: ~2x larger FFT.
-        self._fast_pad_size = _next_fast_size(4 * field_size)
-        # rfft(n=pad) produces pad//2 + 1 complex frequency bins
+        # 2x padding for base (analytic kernel is causal by construction).
+        # SpectralGate needs 4x (modulation can break Kramers-Kronig).
+        self._fast_pad_size = _next_fast_size(2 * field_size)
         self.freq_bins = self._fast_pad_size // 2 + 1
 
         # Optional Monarch FFT: tensor-core-friendly FFT via matmul decomposition
-        # Enable via use_monarch_fft=True or MONARCH_FFT=1 env var
         if use_monarch_fft is None:
             use_monarch_fft = os.environ.get('MONARCH_FFT', '0') == '1'
         self.use_monarch_fft = use_monarch_fft
@@ -259,74 +208,27 @@ class WaveFieldAttention(nn.Module):
                 print(f"  [MonarchFFT] Enabled: pad={self._fast_pad_size}, "
                       f"factors=({self._monarch.P},{self._monarch.Q})")
 
-        # V4.4: Split-Step Kerr nonlinearity — breaks LTI constraint
-        # After FFT convolution, apply pointwise |field|^2 * field (Kerr effect).
-        # This makes large-amplitude tokens (important content) propagate
-        # differently from small ones, achieving content-dependent routing
-        # without extra FFTs. Learnable gamma per head controls strength.
-        # Enable via use_split_step=True or SPLIT_STEP=1 env var.
-        if use_split_step is None:
-            use_split_step = os.environ.get('SPLIT_STEP', '0') == '1'
-        self.use_split_step = use_split_step
-        if use_split_step:
-            # Per-head learnable strength. Saturable form bounds gain to (1+gamma).
-            # With gamma=0.5, max gain = 1.5x. Clamped to [0, 2] in forward.
-            self.kerr_gamma = nn.Parameter(torch.full((num_heads,), 0.5))
-            if layer_idx == 0:
-                print(f"  [SplitStep] Saturable Kerr enabled (gamma_init=0.5, clamp=[0,2])")
-
-        if use_kernel_mixture:
-            # Content-Adaptive Kernel Mixture: K basis kernels, per-token mixing
-            # Replaces SpectralGate with per-token (not per-sample) adaptivity
-            K = num_basis_kernels
-            H = num_heads
-
-            # Multi-scale HiPPO init: spread frequencies and dampings across K scales
-            hippo_base = torch.tensor([math.pi * (2 * n + 1) / 2 for n in range(H)])
-            freq_scales = torch.tensor([0.5, 1.0, 2.0, 4.0][:K])
-            damp_raw = torch.tensor([-1.5, -0.69, 0.0, 0.69][:K])
-            phase_base = torch.linspace(0, math.pi, H)
-
-            self.basis_frequency = nn.Parameter(
-                hippo_base.unsqueeze(1) * freq_scales.unsqueeze(0)  # (H, K)
-            )
-            self.basis_damping = nn.Parameter(
-                damp_raw.unsqueeze(0).expand(H, K).clone()  # (H, K)
-            )
-            self.basis_phase = nn.Parameter(
-                phase_base.unsqueeze(1).expand(H, K).clone()  # (H, K)
-            )
-
-            # Per-token mixing: q @ mix_proj -> (B, H, N, K) weights
-            # Zero init for projection (content-dependent deviation)
-            self.kernel_mix_proj = nn.Parameter(torch.zeros(H, self.head_dim, K))
-
-            # Bias: strongly prefer basis 1 (standard HiPPO) at init
-            # softmax([0, 5, 0, 0]) ≈ [0.5%, 97.9%, 0.5%, 0.5%]
-            # This gives a coherent starting point (like V4.3 single kernel)
-            # Training gradually shifts weight to other kernels per-token
-            bias_init = torch.zeros(K)
-            if K > 1:
-                bias_init[1] = 5.0  # basis 1 = 1.0x HiPPO (standard)
-            self.kernel_mix_bias = nn.Parameter(
-                bias_init.unsqueeze(0).expand(H, K).clone()  # (H, K)
-            )
-
-            self.spectral_gate = None
-        else:
-            # V4.3: Content-adaptive spectral gate (SPECTRE-style)
+        # SpectralGate: content-adaptive kernel modulation (optional).
+        # Constructor param takes precedence, then env var, default off.
+        if use_spectral_gate is None:
+            use_spectral_gate = os.environ.get('SPECTRAL_GATE', '0') == '1'
+        if use_spectral_gate:
             self.spectral_gate = SpectralGate(
                 num_heads=num_heads,
                 head_dim=self.head_dim,
                 freq_bins=self.freq_bins,
                 n_control=32,
             )
+            # 4x padding needed for causal enforcement with SpectralGate
+            self._fast_pad_size = _next_fast_size(4 * field_size)
+            self.freq_bins = self._fast_pad_size // 2 + 1
+        else:
+            self.spectral_gate = None
 
         # ---- WAVE KERNEL PARAMETERS ----
         H = num_heads
-        C = n_components
 
-        if C == 1:
+        if n_components == 1:
             # V4.3.2: Per-layer HiPPO init with diversity (S4D, arXiv:2206.11893)
             # Early layers: low freq (broad patterns), low damping (long reach)
             # Later layers: high freq (sharp local), high damping (fast decay)
@@ -410,32 +312,18 @@ class WaveFieldAttention(nn.Module):
             self.register_buffer('_frozen_damping_mask', None)
             self.register_buffer('_frozen_damping_values', None)
 
-        # ---- LOCAL ATTENTION (near-field) ----
-        if local_window > 0:
-            # Per-head blend: sigmoid(1.0) = 0.73 — biased toward local at init
-            # BASED (Hazy Research 2024) showed local patterns dominate short-range
-            self.local_blend = nn.Parameter(torch.full((H,), 1.0))
-
-            # Precompute causal + window mask (registered buffer → moves with .to(device))
-            rows = torch.arange(max_seq_len).unsqueeze(1)
-            cols = torch.arange(max_seq_len).unsqueeze(0)
-            mask = (cols <= rows) & (rows - cols < local_window)
-            self.register_buffer('_window_mask', mask)
-        else:
-            self.local_blend = None
-
-        # Static multi-field coupling (used when 3D interference is off)
+        # Static multi-field coupling
         self.field_coupling = nn.Parameter(
             torch.eye(H) + torch.randn(H, H) * 0.01
         )
 
-        # V4.4: 3D wave interference — content-dependent cross-head mixing
-        # Replaces static field_coupling with physics-based interference
-        if use_3d_interference:
-            self.head_positions = nn.Parameter(
-                self._init_head_positions(H)
-            )
-            self.token_pos_proj = nn.Linear(embedding_dim, 3)
+        # V4.5.0: Cross-dimension mixing after gather.
+        # The Hadamard product q_feat ⊙ gathered keeps all head_dim dimensions
+        # independent (48 scalar products, not 1 dot product). This Linear layer
+        # lets dimensions interact: "if dims 3 and 17 are both high, output high
+        # in dim 5". Identity init = no change at start.
+        self.cross_dim = nn.Linear(self.head_dim, self.head_dim, bias=False)
+        nn.init.eye_(self.cross_dim.weight)
 
         # Fixed stride for absolute position mapping
         # CAUSALITY CRITICAL: stride < 1 causes bilinear interpolation to share
@@ -469,58 +357,63 @@ class WaveFieldAttention(nn.Module):
         self._kernel_fft_cache = None
         self._kernel_param_snapshot = None
 
-    def _build_wave_kernels(self, device):
-        """
-        Build LEFT-ALIGNED causal wave kernels with caching.
+    def _get_damping(self):
+        """Compute effective damping with frozen-head support and clamping.
 
-        Single-component (C=1): exact V3.5 behavior.
-        Multi-component (C>1): weighted sum of C damped waves per head,
-        enabling multi-resolution attention (wavelet decomposition).
+        Returns: (H,) tensor of damping values in [0, 1.5].
         """
-        # Cache only during eval — during training, params change every step AND
-        # gradient checkpointing re-runs forward with different tensor counts if cached
+        alpha = F.softplus(self.wave_damping)
+        if self._frozen_damping_mask is not None:
+            trainable_alpha = alpha.clone().clamp(max=1.5)
+            return torch.where(
+                self._frozen_damping_mask,
+                self._frozen_damping_values,
+                trainable_alpha
+            )
+        return alpha.clamp(max=1.5)
+
+    def _check_eval_cache(self):
+        """Return cached kernel FFT if params haven't changed (eval only)."""
+        if not self.training and self._kernel_fft_cache is not None and self._kernel_param_snapshot is not None:
+            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
+            if self.component_weights is not None:
+                cache_keys.append(self.component_weights.data)
+            if all(s.equal(c) for s, c in zip(self._kernel_param_snapshot, cache_keys)):
+                return self._kernel_fft_cache
+        return None
+
+    def _save_eval_cache(self, result):
+        """Store kernel FFT in cache (eval only)."""
         if not self.training:
             cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
             if self.component_weights is not None:
                 cache_keys.append(self.component_weights.data)
+            self._kernel_fft_cache = result
+            self._kernel_param_snapshot = [p.clone() for p in cache_keys]
 
-            if self._kernel_fft_cache is not None and self._kernel_param_snapshot is not None:
-                if all(s.equal(c) for s, c in zip(self._kernel_param_snapshot, cache_keys)):
-                    return self._kernel_fft_cache
+    def _build_wave_kernels(self, device):
+        """Build causal wave kernels via time-domain sampling + FFT.
+
+        Single-component (C=1) or multi-component (C>1) damped cosine kernels.
+        """
+        cached = self._check_eval_cache()
+        if cached is not None:
+            return cached
 
         G = self.field_size
-
         t = torch.arange(G, dtype=torch.float32, device=device)
 
         if self.n_components == 1:
-            # Single component: params are (H,) — exact V3.5 path
-            # V4.3.8: Cap damping at 0.5 to prevent kernel reach collapse.
-            # V4.3.9: Frozen heads bypass cap — use fixed values for multi-scale reach.
-            alpha = F.softplus(self.wave_damping)
-            if self._frozen_damping_mask is not None:
-                alpha = torch.where(
-                    self._frozen_damping_mask,
-                    self._frozen_damping_values,
-                    alpha.clamp(max=0.5)
-                )
-            else:
-                alpha = alpha.clamp(max=0.5)
-            alpha = alpha.unsqueeze(1)   # (H, 1)
+            alpha = self._get_damping().unsqueeze(1)              # (H, 1)
             omega = self.wave_frequency.unsqueeze(1)              # (H, 1)
             phi = self.wave_phase.unsqueeze(1)                    # (H, 1)
-
             kernels = torch.exp(-alpha * t.unsqueeze(0)) * torch.cos(omega * t.unsqueeze(0) + phi)
         else:
-            # Multi-component: params are (H, C), sum weighted components
-            alpha = F.softplus(self.wave_damping).clamp(max=0.5).unsqueeze(2)   # (H, C, 1)
+            alpha = F.softplus(self.wave_damping).clamp(max=1.5).unsqueeze(2)   # (H, C, 1)
             omega = self.wave_frequency.unsqueeze(2)              # (H, C, 1)
             phi = self.wave_phase.unsqueeze(2)                    # (H, C, 1)
             t_exp = t.unsqueeze(0).unsqueeze(0)                   # (1, 1, G)
-
-            # Per-component kernels: (H, C, G)
             components = torch.exp(-alpha * t_exp) * torch.cos(omega * t_exp + phi)
-
-            # Weighted sum across components
             weights = F.softmax(self.component_weights, dim=-1).unsqueeze(2)  # (H, C, 1)
             kernels = (weights * components).sum(dim=1)  # (H, G)
 
@@ -530,64 +423,26 @@ class WaveFieldAttention(nn.Module):
         kernels = kernels / kernel_sum
 
         result = torch.fft.rfft(kernels, n=self._fast_pad_size)
-
-        # Cache (eval only — training invalidates every step + breaks checkpointing)
-        if not self.training:
-            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
-            if self.component_weights is not None:
-                cache_keys.append(self.component_weights.data)
-            self._kernel_fft_cache = result
-            self._kernel_param_snapshot = [p.clone() for p in cache_keys]
-
+        self._save_eval_cache(result)
         return result
 
     def _build_analytic_kernel_fft(self, device):
-        """Analytic FFT of complex exponential kernel via Z-transform (S4D-style).
+        """Analytic FFT via Z-transform (S4D-style). Single-component only.
 
-        Instead of materializing G time-domain samples and FFTing, computes the
-        DFT directly from complex poles using the geometric series closed form:
-
-          H(z_k) = (1 - exp(lambda*G) * z_k^{-G}) / (1 - exp(lambda) * z_k^{-1})
-
-        where lambda = -alpha + i*omega is the complex pole per head, and
-        z_k = exp(i*2*pi*k / 2G) are the DFT frequency bins.
-
-        The real kernel (conjugate pair) is: c*H(z) + conj(c)*H(conj(z))
-        where c = exp(i*phi) applies the phase offset.
-
-        Benefits over time-domain approach:
-          - Automatic causality (sums only t >= 0, no _enforce_causal_kernel needed)
-          - Direct gradient flow through pole params (alpha, omega) to loss
-          - Kramers-Kronig compliant by construction
-          - Minimum-phase property when alpha > 0
-
-        Returns: (H, freq_bins) complex — same format as _build_wave_kernels.
-        Only supports single-component (C=1) kernels.
+        Computes DFT directly from complex poles — causal by construction,
+        no time-domain materialization needed.
         """
-        # Eval caching (same logic as _build_wave_kernels)
-        if not self.training:
-            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
-            if self._kernel_fft_cache is not None and self._kernel_param_snapshot is not None:
-                if all(s.equal(c) for s, c in zip(self._kernel_param_snapshot, cache_keys)):
-                    return self._kernel_fft_cache
+        cached = self._check_eval_cache()
+        if cached is not None:
+            return cached
 
         G = self.field_size
         pad_size = self._fast_pad_size
-        freq_bins = self.freq_bins  # rfft output size for n=pad_size
+        freq_bins = self.freq_bins
 
-        # Complex pole: lambda = -alpha + i*omega
-        # V4.3.9: Frozen heads bypass cap (same logic as time-domain path)
-        alpha = F.softplus(self.wave_damping)
-        if self._frozen_damping_mask is not None:
-            alpha = torch.where(
-                self._frozen_damping_mask,
-                self._frozen_damping_values,
-                alpha.clamp(max=0.5)
-            )
-        else:
-            alpha = alpha.clamp(max=0.5)  # (H,) positive damping
-        omega = self.wave_frequency             # (H,) frequency
-        phi = self.wave_phase                   # (H,) phase
+        alpha = self._get_damping()
+        omega = self.wave_frequency
+        phi = self.wave_phase
 
         # Build complex quantities (all in float32)
         lam = torch.complex(-alpha.float(), omega.float())                  # (H,)
@@ -637,68 +492,8 @@ class WaveFieldAttention(nn.Module):
         dc = kernel_fft[:, 0:1].real.abs().clamp(min=1e-8)
         kernel_fft = kernel_fft / dc
 
-        # Cache (eval only)
-        if not self.training:
-            cache_keys = [self.wave_frequency.data, self.wave_damping.data, self.wave_phase.data]
-            self._kernel_fft_cache = kernel_fft
-            self._kernel_param_snapshot = [p.clone() for p in cache_keys]
-
+        self._save_eval_cache(kernel_fft)
         return kernel_fft
-
-    def _build_basis_kernel_ffts(self, device):
-        """Build K analytic kernel FFTs for Content-Adaptive Kernel Mixture.
-
-        Vectorized Z-transform: same math as _build_analytic_kernel_fft but
-        with (H, K) shaped poles. Returns (K, H, freq_bins) complex.
-        Causal by construction — no _enforce_causal_kernel needed.
-        """
-        G = self.field_size
-        pad_size = self._fast_pad_size
-        freq_bins = self.freq_bins
-
-        alpha = F.softplus(self.basis_damping)   # (H, K)
-        omega = self.basis_frequency              # (H, K)
-        phi = self.basis_phase                    # (H, K)
-
-        # Complex poles: lambda = -alpha + i*omega  (H, K)
-        lam = torch.complex(-alpha.float(), omega.float())
-        c = torch.complex(torch.cos(phi.float()), torch.sin(phi.float()))
-
-        # DFT frequency bins: z_k = exp(i * 2*pi*k / pad_size)
-        k_freq = torch.arange(freq_bins, device=device, dtype=torch.float32)
-        z = torch.exp(torch.complex(
-            torch.zeros_like(k_freq),
-            2.0 * math.pi * k_freq / pad_size
-        ))  # (freq_bins,)
-
-        # Broadcasting: (H, K, 1) x (1, 1, freq_bins)
-        exp_lam = torch.exp(lam).unsqueeze(2)        # (H, K, 1)
-        exp_lam_G = torch.exp(lam * G).unsqueeze(2)  # (H, K, 1)
-        c_bc = c.unsqueeze(2)                          # (H, K, 1)
-        z_bc = z.unsqueeze(0).unsqueeze(0)             # (1, 1, freq_bins)
-
-        z_inv = 1.0 / z_bc
-        z_inv_G = z_inv ** G
-
-        numerator = 1.0 - exp_lam_G * z_inv_G
-        denominator = 1.0 - exp_lam * z_inv
-        denom_safe = denominator + 1e-10 * (denominator.abs() < 1e-10).float()
-
-        H_z = numerator / denom_safe  # (H, K, freq_bins)
-
-        # Conjugate pole
-        H_z_conj = (1.0 - exp_lam_G.conj() * z_inv_G) / (
-            (1.0 - exp_lam.conj() * z_inv) + 1e-10 * ((1.0 - exp_lam.conj() * z_inv).abs() < 1e-10).float()
-        )
-
-        # Real kernel DFT
-        kernel_fft = c_bc * H_z + c_bc.conj() * H_z_conj  # (H, K, freq_bins)
-
-        # Normalize by DC
-        dc = kernel_fft[:, :, 0:1].real.abs().clamp(min=1e-8)
-        kernel_fft = kernel_fft / dc
-
-        return kernel_fft.permute(1, 0, 2)  # (K, H, freq_bins)
 
     def _enforce_causal_kernel(self, kernel_fft, G):
         """Project a frequency-domain kernel back to causal (zero for t >= G).
@@ -735,27 +530,20 @@ class WaveFieldAttention(nn.Module):
             a_real * b_imag + a_imag * b_real,
         )
 
-    def _wave_convolve(self, field, kernel_fft):
+    def _wave_convolve(self, field, kernel_fft, needs_causal_enforce=False):
         """Per-head wave convolution via zero-padded FFT (linear convolution).
 
-        kernel_fft: (H, freq_bins) for static kernel, or
-                    (B, H, freq_bins) for content-adaptive (spectral gate).
-
-        Uses 4D layout (B, D, H, G) to avoid expanding kernel across D —
-        CUDA broadcasting handles it, saving 16 MB allocation per layer.
-
-        CAUSALITY NOTE: FFT convolution is causal when the kernel is causal
-        (zero for t >= G) and padding is sufficient for linear convolution.
-        The actual causality guarantee comes from stride >= 1.0 in scatter/
-        gather (each token maps to its own field cell, no sharing).
+        Args:
+            field: (B, H, G, D)
+            kernel_fft: (H, freq_bins) static or (B, H, freq_bins) adaptive
+            needs_causal_enforce: if True, project kernel to causal via
+                IFFT→zero→FFT. Required when SpectralGate modulates the kernel
+                (can break Kramers-Kronig). Not needed for analytic kernels.
         """
         B, H, G, D = field.shape
         pad_size = self._fast_pad_size
 
-        # Enforce causality: spectral gate modulation can introduce anti-causal
-        # components by breaking the Hilbert transform relationship. Project
-        # back to causal space before convolving.
-        if kernel_fft.dim() == 3 and not self.skip_causal_enforce:
+        if needs_causal_enforce and not self.skip_causal_enforce:
             kernel_fft = self._enforce_causal_kernel(kernel_fft, G)
 
         # Keep 4D: (B, H, G, D) → (B, D, H, G) — FFT along last dim (G)
@@ -791,192 +579,54 @@ class WaveFieldAttention(nn.Module):
         return convolved.permute(0, 2, 3, 1)  # back to (B, H, G, D)
 
     def _bilinear_scatter(self, values, idx_lo, idx_hi, frac, B, H, G, head_dim, device):
-        """Deposit values onto field using bilinear interpolation.
+        """Deposit values onto field using integer or bilinear interpolation.
 
-        Uses precomputed indices (cached as buffers) to avoid recomputation.
+        V4.4.0: When stride >= 1.0, frac is always 0 — skip the expensive
+        bilinear path (2 scatter_add_ + 2 weight multiplies) and use direct
+        single scatter_add_ instead. ~2x faster on scatter step.
         """
         N = idx_lo.shape[0]
-
-        # Cast weights to match values dtype (AMP produces float16 values but float32 positions)
-        w_lo = (1.0 - frac).to(values.dtype).view(1, 1, N, 1)
-        w_hi = frac.to(values.dtype).view(1, 1, N, 1)
-
         field = torch.zeros(B, H, G, head_dim, device=device, dtype=values.dtype)
-
         idx_lo_exp = idx_lo.view(1, 1, N, 1).expand(B, H, -1, head_dim)
-        idx_hi_exp = idx_hi.view(1, 1, N, 1).expand(B, H, -1, head_dim)
 
-        field.scatter_add_(2, idx_lo_exp, values * w_lo)
-        field.scatter_add_(2, idx_hi_exp, values * w_hi)
+        if frac.abs().max() < 1e-6:
+            # Integer stride: no interpolation needed
+            field.scatter_add_(2, idx_lo_exp, values)
+        else:
+            # Fractional stride: bilinear interpolation
+            w_lo = (1.0 - frac).to(values.dtype).view(1, 1, N, 1)
+            w_hi = frac.to(values.dtype).view(1, 1, N, 1)
+            idx_hi_exp = idx_hi.view(1, 1, N, 1).expand(B, H, -1, head_dim)
+            field.scatter_add_(2, idx_lo_exp, values * w_lo)
+            field.scatter_add_(2, idx_hi_exp, values * w_hi)
 
         return field
 
     def _bilinear_gather(self, field, idx_lo, idx_hi, frac):
-        """Read from field using bilinear interpolation.
+        """Read from field using integer or bilinear interpolation.
 
-        Uses precomputed indices (cached as buffers) to avoid recomputation.
+        V4.4.0: Fast path when frac=0 (integer stride) — single gather.
         """
         B, H, G, D = field.shape
         N = idx_lo.shape[0]
-
-        # Cast weights to match field dtype (AMP produces float16 field but float32 positions)
-        w_lo = (1.0 - frac).to(field.dtype).view(1, 1, N, 1)
-        w_hi = frac.to(field.dtype).view(1, 1, N, 1)
-
         idx_lo_exp = idx_lo.view(1, 1, N, 1).expand(B, H, -1, D)
-        idx_hi_exp = idx_hi.view(1, 1, N, 1).expand(B, H, -1, D)
 
-        val_lo = torch.gather(field, 2, idx_lo_exp)
-        val_hi = torch.gather(field, 2, idx_hi_exp)
-
-        return val_lo * w_lo + val_hi * w_hi
+        if frac.abs().max() < 1e-6:
+            # Integer stride: direct gather
+            return torch.gather(field, 2, idx_lo_exp)
+        else:
+            # Fractional stride: bilinear interpolation
+            w_lo = (1.0 - frac).to(field.dtype).view(1, 1, N, 1)
+            w_hi = frac.to(field.dtype).view(1, 1, N, 1)
+            idx_hi_exp = idx_hi.view(1, 1, N, 1).expand(B, H, -1, D)
+            val_lo = torch.gather(field, 2, idx_lo_exp)
+            val_hi = torch.gather(field, 2, idx_hi_exp)
+            return val_lo * w_lo + val_hi * w_hi
 
     def _apply_field_coupling(self, field):
         """Static multi-field coupling via einsum (avoids flatten + bmm + reshape)."""
         coupling = F.softmax(self.field_coupling, dim=-1)
         return torch.einsum('ij,bjgd->bigd', coupling, field)
-
-    def _kernel_mixture_forward(self, field, q, idx_lo, idx_hi, frac, x):
-        """Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing.
-
-        Each query token selects its own weighted mixture of K convolved fields.
-        Sequential loop over K kernels to save memory (reuses field_fft).
-
-        field: (B, H, G, D) — scattered deposit
-        q: (B, H, N, head_dim) — raw queries (pre-feature-map)
-        idx_lo, idx_hi, frac: precomputed scatter/gather indices
-        x: (B, N, D) — original input (for 3D interference if enabled)
-        Returns: (B, H, N, D) — gathered output
-        """
-        B, H, G, D = field.shape
-        K = self.num_basis_kernels
-        N = q.shape[2]
-        pad_size = self._fast_pad_size
-
-        # 1. Build K basis kernel FFTs: (K, H, freq_bins)
-        basis_ffts = self._build_basis_kernel_ffts(field.device)
-
-        # 2. Per-token mixing weights: q @ mix_proj + bias -> softmax over K
-        # fp32 for numerical stability under AMP
-        # bias provides strong prior (98% on standard HiPPO at init)
-        # q @ mix_proj adds content-dependent deviation
-        alpha = torch.einsum('bhnd,hdk->bhnk', q.float(), self.kernel_mix_proj.float())
-        alpha = alpha + self.kernel_mix_bias.float().unsqueeze(0).unsqueeze(2)  # (1, H, 1, K)
-        alpha = F.softmax(alpha, dim=-1).to(field.dtype)  # (B, H, N, K)
-
-        # 3. Compute field FFT once (reused for all K kernels)
-        field_t = field.permute(0, 3, 1, 2).contiguous()  # (B, D, H, G)
-        input_dtype = field_t.dtype
-        field_fft = torch.fft.rfft(field_t.float(), n=pad_size)  # (B, D, H, freq)
-
-        # 4. Sequential convolution loop: convolve → couple → gather → accumulate
-        output = torch.zeros(B, H, N, D, device=field.device, dtype=input_dtype)
-
-        for m in range(K):
-            # Convolve with m-th basis kernel: (H, freq) static — broadcasts over (B, D)
-            convolved_fft = field_fft * basis_ffts[m]  # (B, D, H, freq)
-            convolved = torch.fft.irfft(convolved_fft, n=pad_size)[..., :G]
-            field_m = convolved.to(input_dtype).permute(0, 2, 3, 1)  # (B, H, G, D)
-
-            # Field coupling (shared across K)
-            if self.use_3d_interference:
-                field_m = self._apply_3d_interference(field_m, x)
-            else:
-                field_m = self._apply_field_coupling(field_m)
-
-            # Gather at token positions
-            gathered_m = self._bilinear_gather(field_m, idx_lo, idx_hi, frac)  # (B, H, N, D)
-
-            # Weight by per-token alpha and accumulate
-            output = output + alpha[:, :, :, m:m+1] * gathered_m
-
-        return output
-
-    @staticmethod
-    def _init_head_positions(H):
-        """Initialize head positions for maximum spatial diversity."""
-        if H == 8:
-            # Cube vertices — perfect spacing for 8 heads
-            return torch.tensor([
-                [-0.5, -0.5, -0.5], [-0.5, -0.5, 0.5],
-                [-0.5, 0.5, -0.5], [-0.5, 0.5, 0.5],
-                [0.5, -0.5, -0.5], [0.5, -0.5, 0.5],
-                [0.5, 0.5, -0.5], [0.5, 0.5, 0.5],
-            ], dtype=torch.float32)
-        else:
-            # Fibonacci sphere for arbitrary H
-            golden = (1 + 5 ** 0.5) / 2
-            i = torch.arange(H, dtype=torch.float32)
-            theta = 2 * math.pi * i / golden
-            phi = torch.acos(1 - 2 * (i + 0.5) / H)
-            return torch.stack([
-                torch.sin(phi) * torch.cos(theta),
-                torch.sin(phi) * torch.sin(theta),
-                torch.cos(phi),
-            ], dim=-1) * 0.5
-
-    def _apply_3d_interference(self, field, x):
-        """Content-dependent cross-head mixing via 3D wave interference.
-
-        Each head is a wave source at a learned 3D position. Token embeddings
-        are projected to 3D positions. The interference pattern between heads
-        (based on path differences to the reference point) determines coupling.
-
-        field: (B, H, G, D)
-        x: (B, N, D) — original input for content-dependent positions
-        Returns: (B, H, G, D)
-        """
-        B, H, G, D_field = field.shape
-
-        # Content-dependent 3D position (first token as reference, like SpectralGate)
-        tok_pos = self.token_pos_proj(x)     # (B, N, 3)
-        ref_pos = tok_pos[:, 0, :]           # (B, 3)
-        head_pos = self.head_positions       # (H, 3)
-
-        # Distance from reference point to each head source
-        dist = torch.norm(
-            ref_pos.unsqueeze(1) - head_pos.unsqueeze(0), dim=-1
-        )  # (B, H)
-
-        # Path difference between head pairs → interference
-        dist_i = dist.unsqueeze(2)  # (B, H, 1)
-        dist_j = dist.unsqueeze(1)  # (B, 1, H)
-        path_diff = (dist_i - dist_j).abs()  # (B, H, H)
-
-        # Per-head-pair wave params (pairwise average preserves head diversity)
-        alpha_h = F.softplus(self.wave_damping)    # (H,)
-        omega_h = self.wave_frequency.abs()        # (H,)
-        alpha_ij = (alpha_h.unsqueeze(0) + alpha_h.unsqueeze(1)) / 2  # (H, H)
-        omega_ij = (omega_h.unsqueeze(0) + omega_h.unsqueeze(1)) / 2  # (H, H)
-
-        # Interference: constructive when path_diff ≈ n*lambda, destructive otherwise
-        interference = (
-            torch.exp(-alpha_ij * path_diff)
-            * torch.cos(omega_ij * path_diff)
-        )  # (B, H, H)
-        coupling = F.softmax(interference, dim=-1)  # (B, H, H)
-
-        return torch.einsum('bij,bjgd->bigd', coupling, field)
-
-    def _local_attention(self, q, k, v, N):
-        """
-        Sliding window causal dot-product attention (near-field).
-
-        q, k, v: (B, H, N, head_dim)
-        Returns: (B, H, N, head_dim)
-
-        Uses precomputed causal+window mask. Masked positions get -inf
-        before softmax, so they contribute zero weight.
-        """
-        # Scaled dot-product scores: (B, H, N, N)
-        scores = torch.matmul(q, k.transpose(-2, -1)) / self.scale
-
-        # Apply causal + window mask (slice to actual seq length)
-        mask = self._window_mask[:N, :N]  # (N, N) bool
-        scores = scores.masked_fill(~mask.unsqueeze(0).unsqueeze(0), float('-inf'))
-
-        attn_weights = F.softmax(scores, dim=-1)
-        return torch.matmul(attn_weights, v)
 
     def forward(self, x, mask=None):
         if x.dim() == 2:
@@ -1021,66 +671,34 @@ class WaveFieldAttention(nn.Module):
         # K-WEIGHTED DEPOSIT: K modulates V per dimension (D-dim routing, not scalar!)
         deposit = k_feat * v  # (B, H, N, head_dim)
 
-        # V4.4: Selective write gate — per-token control of field contribution
-        # Gate input is raw K (mean-zero), not k_feat (post-ReLU, all positive)
-        if self.use_write_gate:
-            write_strength = torch.sigmoid(self.write_gate_proj(k))  # (B, H, N, 1)
-            deposit = deposit * write_strength
-
         # SCATTER → CONVOLVE → COUPLE → GATHER
         field = self._bilinear_scatter(deposit, idx_lo, idx_hi, frac, B, H, G, head_dim, x.device)
 
-        if self.use_kernel_mixture:
-            # Content-Adaptive Kernel Mixture: K basis convolutions, per-token mixing
-            gathered = self._kernel_mixture_forward(field, q, idx_lo, idx_hi, frac, x)
+        # Build wave kernel FFT
+        if self.use_analytic_kernel and self.n_components == 1:
+            base_kernel_fft = self._build_analytic_kernel_fft(x.device)
         else:
-            # V4.3 path: single kernel with SpectralGate modulation
-            if self.use_analytic_kernel and self.n_components == 1:
-                base_kernel_fft = self._build_analytic_kernel_fft(x.device)
-            else:
-                base_kernel_fft = self._build_wave_kernels(x.device)
+            base_kernel_fft = self._build_wave_kernels(x.device)
 
+        # SpectralGate: content-adaptive kernel (optional)
+        has_spectral_gate = self.spectral_gate is not None
+        if has_spectral_gate:
             kernel_fft = self.spectral_gate(q, base_kernel_fft)  # (B, H, freq_bins)
-            field = self._wave_convolve(field, kernel_fft)
-
-            # V4.4: Split-Step Kerr nonlinearity (saturable)
-            # field shape: (B, H, G, D). gamma: (H,) -> (1, H, 1, 1)
-            # Saturable Kerr: field = field * (1 + gamma * |field| / (1 + |field|))
-            # The denominator (1 + |field|) prevents explosive growth:
-            #   small |field| -> linear amplification (Kerr regime)
-            #   large |field| -> saturates at (1 + gamma) gain (stable)
-            # This models real-world saturable absorption in nonlinear optics.
-            if self.use_split_step:
-                gamma = self.kerr_gamma.clamp(0, 2.0).view(1, -1, 1, 1)  # (1, H, 1, 1)
-                field_abs = field.abs()
-                field = field * (1.0 + gamma * field_abs / (1.0 + field_abs))
-
-            if self.use_3d_interference:
-                field = self._apply_3d_interference(field, x)
-            else:
-                field = self._apply_field_coupling(field)
-
-            gathered = self._bilinear_gather(field, idx_lo, idx_hi, frac)  # (B, H, N, head_dim)
-
-        # Q-WEIGHTED READING: Q selects which dimensions to use
-        wave_output = q_feat * gathered  # (B, H, N, head_dim)
-
-        # ================= LOCAL ATTENTION PATH (near-field) =================
-        if self.local_window > 0:
-            local_out = self._local_attention(q, k, v, N)  # (B, H, N, head_dim)
-
-            # Learned per-head blend: wave ←→ local
-            blend = torch.sigmoid(self.local_blend).view(1, H, 1, 1)
-            combined = (1.0 - blend) * wave_output + blend * local_out
         else:
-            combined = wave_output
+            kernel_fft = base_kernel_fft  # (H, freq_bins) — static, already causal
+        field = self._wave_convolve(field, kernel_fft,
+                                    needs_causal_enforce=has_spectral_gate)
 
-        # ================= GATING + OUTPUT =================
-        # CONTENT-DEPENDENT GATING (from fused projection)
-        gate = torch.sigmoid(gate_raw)
-        gate = gate.view(B, N, H, head_dim).transpose(1, 2)
+        field = self._apply_field_coupling(field)
 
-        output = combined * gate
+        gathered = self._bilinear_gather(field, idx_lo, idx_hi, frac)  # (B, H, N, head_dim)
+
+        # Q-weighted reading + cross-dimension mixing
+        wave_output = self.cross_dim(q_feat * gathered)  # (B, H, N, head_dim)
+
+        # Content-dependent gating
+        gate = torch.sigmoid(gate_raw).view(B, N, H, head_dim).transpose(1, 2)
+        output = wave_output * gate
 
         output = output.transpose(1, 2).reshape(B, N, D)
         output = self.out_proj(output)

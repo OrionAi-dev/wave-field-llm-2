@@ -2,22 +2,17 @@
 Wave Field Transformer - Physics-Based Language Model
 =====================================================
 
-Field LLM V3: A genuinely new architecture that treats language as a
-physical field system, not just a sequence of tokens.
+Hybrid architecture combining O(n log n) wave field attention with optional
+standard O(n²) attention layers and O(n) GLA (gated linear attention) layers.
 
-What's NEW (vs any existing architecture):
-1. Wave-parameterized attention (damped oscillation kernels, not arbitrary)
-2. Content-dependent gating (adaptive attention patterns)
-3. Multi-field coupling (cross-head field interactions)
-4. Energy conservation (information can't be created/destroyed)
-5. Field interference (constructive/destructive signal combination)
+Core: tokens scatter onto a continuous 1D field, damped wave kernels convolve
+via FFT, cross-head coupling mixes fields, results gather back at token
+positions. Content-dependent gating controls output.
 
-What this is NOT:
-- Not a Mamba clone (no state space recurrence)
-- Not a Hyena clone (physics-parameterized kernels, not implicit NN kernels)
-- Not a standard transformer (O(n log n), not O(n²))
-
-Complexity: O(n log n) per layer — between O(n) and O(n²)
+Supports:
+- Pure wave field model (all layers wave-based)
+- Hybrid: wave + standard attention at specified layer indices
+- Hybrid: wave + GLA with Zamba2-style weight sharing
 """
 
 import torch
@@ -68,25 +63,16 @@ class SinusoidalPositionalEncoding(nn.Module):
 
 
 class WaveFieldTransformerLayer(nn.Module):
-    """
-    Single layer of the Wave Field Transformer.
-    
-    Structure:
-    1. Wave Field Attention (physics-based, content-dependent)
-    2. Feed-Forward Network (standard)
-    3. Pre-norm residual connections
-    """
-    
+    """Pre-norm wave field attention + FFN with residual connections."""
+
     def __init__(self, embedding_dim=256, num_heads=8, ffn_dim=1024,
                  field_size=512, max_seq_len=128, dropout=0.1,
-                 n_components=1, local_window=0, use_analytic_kernel=True,
-                 feature_map_depth=2, use_write_gate=True,
-                 use_3d_interference=False,
-                 use_kernel_mixture=False, num_basis_kernels=4,
+                 n_components=1, use_analytic_kernel=True,
+                 feature_map_depth=2,
                  layer_idx=0, num_layers=1,
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
-                 use_split_step=None,
+                 use_spectral_gate=None,
                  device='cuda'):
         super().__init__()
 
@@ -96,18 +82,13 @@ class WaveFieldTransformerLayer(nn.Module):
             field_size=field_size,
             max_seq_len=max_seq_len,
             n_components=n_components,
-            local_window=local_window,
             use_analytic_kernel=use_analytic_kernel,
             feature_map_depth=feature_map_depth,
-            use_write_gate=use_write_gate,
-            use_3d_interference=use_3d_interference,
-            use_kernel_mixture=use_kernel_mixture,
-            num_basis_kernels=num_basis_kernels,
             layer_idx=layer_idx,
             num_layers=num_layers,
             skip_causal_enforce=skip_causal_enforce,
             n_frozen_heads=n_frozen_heads,
-            use_split_step=use_split_step,
+            use_spectral_gate=use_spectral_gate,
             device=device
         )
         
@@ -214,18 +195,16 @@ class FieldInterferenceModule(nn.Module):
 class WaveFieldTransformer(nn.Module):
     """
     Wave Field Transformer for Language Modeling.
-    
-    A physics-based language model where:
-    - Tokens are mapped to a continuous field
-    - Information propagates via wave dynamics (not convolution)
-    - Different heads = different fields with different physics
-    - Fields interact through coupling
-    - Energy is conserved (anti-hallucination)
-    - Interference patterns route information
-    
-    Drop-in replacement for CausalFieldTransformer — same interface.
+
+    Physics-based language model: tokens scatter onto a continuous 1D field,
+    information propagates via damped wave kernels (FFT convolution), and
+    results gather back. O(n log n) per wave layer.
+
+    Supports hybrid architectures: wave layers + standard attention layers
+    (at positions specified by hybrid_attention_layers) + GLA layers
+    (at positions specified by gla_layers, with Zamba2-style weight sharing).
     """
-    
+
     def __init__(self,
                  vocab_size=50257,
                  embedding_dim=256,
@@ -238,18 +217,13 @@ class WaveFieldTransformer(nn.Module):
                  use_checkpoint=False,
                  interference_interval=3,
                  n_components=1,
-                 local_window=0,
                  device=None,
                  use_analytic_kernel=True,
                  feature_map_depth=2,
                  residual_scale=False,
-                 use_write_gate=True,
-                 use_3d_interference=False,
-                 use_kernel_mixture=False,
-                 num_basis_kernels=4,
                  skip_causal_enforce=False,
                  n_frozen_heads=0,
-                 use_split_step=None,
+                 use_spectral_gate=None,
                  hybrid_attention_layers=None,
                  gla_layers=None):
         super().__init__()
@@ -312,18 +286,13 @@ class WaveFieldTransformer(nn.Module):
                     max_seq_len=max_seq_len,
                     dropout=dropout,
                     n_components=n_components,
-                    local_window=local_window,
                     use_analytic_kernel=use_analytic_kernel,
                     feature_map_depth=feature_map_depth,
-                    use_write_gate=use_write_gate,
-                    use_3d_interference=use_3d_interference,
-                    use_kernel_mixture=use_kernel_mixture,
-                    num_basis_kernels=num_basis_kernels,
                     layer_idx=layer_idx,
                     num_layers=num_layers,
                     skip_causal_enforce=skip_causal_enforce,
                     n_frozen_heads=n_frozen_heads,
-                    use_split_step=use_split_step,
+                    use_spectral_gate=use_spectral_gate,
                     device=self.device
                 ))
         
@@ -385,27 +354,10 @@ class WaveFieldTransformer(nn.Module):
                 # V4.5.0: Cross-dim mixing — restore identity init
                 nn.init.eye_(attn.cross_dim.weight)
 
-                # Spectral gate: restore small-but-meaningful init (skip if kernel mixture)
-                # V4.3.4: 20x larger (was 0.001). Combined with 50x LR + no weight decay,
-                # ensures gate can actually learn spectral modulation.
+                # Spectral gate: restore meaningful init
                 if attn.spectral_gate is not None:
                     nn.init.normal_(attn.spectral_gate.net[-1].weight, 0, 0.02)
                     nn.init.zeros_(attn.spectral_gate.net[-1].bias)
-
-                # Kernel mixture: restore zero init for projection, warm bias for basis 1
-                if hasattr(attn, 'kernel_mix_proj'):
-                    attn.kernel_mix_proj.data.zero_()
-                if hasattr(attn, 'kernel_mix_bias'):
-                    K = attn.kernel_mix_bias.shape[-1]
-                    attn.kernel_mix_bias.data.zero_()
-                    if K > 1:
-                        attn.kernel_mix_bias.data[:, 1] = 5.0  # 98% on standard HiPPO
-
-                # V4.4: 3D interference — larger token position scale for
-                # spatial diversity (generic init gives std=0.02, too small)
-                if hasattr(attn, 'token_pos_proj'):
-                    nn.init.normal_(attn.token_pos_proj.weight, 0, 0.1)
-                    nn.init.zeros_(attn.token_pos_proj.bias)
 
         # V4.2-D: Residual scaling — scale down residual contribution at init
         # to stabilize deep networks (GPT-style 1/sqrt(2*num_layers)).
@@ -422,14 +374,15 @@ class WaveFieldTransformer(nn.Module):
                             qk_lr_mult=3.0, kernel_lr_mult=50.0):
         """Create AdamW with per-group learning rates.
 
-        Four param groups (V4.3.4):
+        3 param groups:
         1. Other params: base_lr (default)
-        2. QKV projections: base_lr × 3 (V4.2 ablation: -21% PPL)
-        3. Kernel physics params + SpectralGate: base_lr × 50, weight_decay=0
-           V4.3.4: SpectralGate moved here from group 1. At base_lr + wd=0.01,
-           the gate decayed faster than it learned (range < 0.07 after 20M tokens).
+        2. QKV projections (wave qkvg_proj + GLA/hybrid Q/K/V): base_lr × qk_lr_mult
+        3. Kernel physics params + SpectralGate: base_lr × kernel_lr_mult, wd=0
         """
         kernel_names = {'wave_frequency', 'wave_damping', 'wave_phase'}
+        # Match QKV projections across all layer types
+        qk_proj_names = {'qkvg_proj', 'q_proj', 'k_proj', 'v_proj',
+                         'in_proj_weight', 'in_proj_bias'}
         kernel_params = []
         qk_params = []
         other_params = []
@@ -440,10 +393,10 @@ class WaveFieldTransformer(nn.Module):
             param_leaf = name.split('.')[-1]
             if param_leaf in kernel_names:
                 kernel_params.append(param)
-            elif 'qkvg_proj' in name:
-                qk_params.append(param)
             elif 'spectral_gate' in name:
                 kernel_params.append(param)
+            elif any(qk_name in name for qk_name in qk_proj_names):
+                qk_params.append(param)
             else:
                 other_params.append(param)
 
@@ -469,10 +422,17 @@ class WaveFieldTransformer(nn.Module):
         if not hasattr(torch, 'compile'):
             return self
 
+        # Compile GLA source layer first, then update all shared references
+        compiled_gla = None
         for i, layer in enumerate(self.layers):
             if i in self._gla_indices:
                 if i not in self._gla_shared_source:
-                    self.layers[i] = torch.compile(layer, mode=mode)
+                    # This is the source GLA layer — compile it
+                    compiled_gla = torch.compile(layer, mode=mode)
+                    self.layers[i] = compiled_gla
+                else:
+                    # Shared layer — point to the compiled source
+                    self.layers[i] = compiled_gla
                 continue
             if i in self._hybrid_indices:
                 # Standard TransformerEncoderLayer — compile the whole thing
@@ -547,9 +507,11 @@ class WaveFieldTransformer(nn.Module):
                 else:
                     x = layer(x, mask)
 
-            # Apply field interference periodically
+            # Apply field interference periodically (skip after hybrid/GLA layers —
+            # they already have global context from O(n²) attention or recurrence)
             if ((i + 1) % self.interference_interval == 0 and
-                    interference_idx < len(self.interference_modules)):
+                    interference_idx < len(self.interference_modules)
+                    and not is_hybrid and not is_gla):
                 x = self.interference_modules[interference_idx](x)
                 interference_idx += 1
         
@@ -599,19 +561,15 @@ if __name__ == '__main__':
     print(f"Loss:   {loss.item():.3f}")
     print("Wave Field Transformer works!")
 
-    # Test kernel mixture mode
-    print("\nTesting Kernel Mixture mode...")
-    model_km = WaveFieldTransformer(
+    # Test hybrid mode
+    print("\nTesting Hybrid mode (standard attn at layer 3)...")
+    model_h = WaveFieldTransformer(
         vocab_size=256, embedding_dim=256, num_layers=6, num_heads=8,
         ffn_dim=1024, field_size=512,
-        use_kernel_mixture=True, num_basis_kernels=4,
-        use_write_gate=False, device=device
+        hybrid_attention_layers=[3], device=device
     ).to(device)
-    km_params = sum(p.numel() for p in model_km.parameters())
-    print(f"Params (kernel mixture): {km_params:,} (vs {param_count:,} SpectralGate)")
-    logits_km, loss_km = model_km(x, labels=y)
-    print(f"Loss:   {loss_km.item():.3f}")
-    # Verify mixing weights are zero-init
-    mix_max = model_km.layers[0].attention.kernel_mix_proj.abs().max().item()
-    print(f"kernel_mix_proj max: {mix_max:.6f} (should be 0)")
-    print("Kernel Mixture works!")
+    h_params = sum(p.numel() for p in model_h.parameters())
+    print(f"Params (hybrid): {h_params:,} (vs {param_count:,} pure wave)")
+    logits_h, loss_h = model_h(x, labels=y)
+    print(f"Loss:   {loss_h.item():.3f}")
+    print("Hybrid mode works!")

@@ -18,8 +18,8 @@ model = WaveFieldTransformer(
     num_heads=8, ffn_dim=1536, field_size=512,
     max_seq_len=514, dropout=0.0, use_checkpoint=False,
     interference_interval=3, n_components=1,
-    local_window=0, n_frozen_heads=4,
-    use_split_step=True, device=device,
+    n_frozen_heads=4,
+    device=device,
 ).to(device)
 
 # Hook into the attention layers to measure field values

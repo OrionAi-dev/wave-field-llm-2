@@ -70,8 +70,8 @@ model = WaveFieldTransformer(
     num_heads=HEADS, ffn_dim=FFN, field_size=FIELD_SIZE,
     max_seq_len=SEQ + 2, dropout=0.1, use_checkpoint=True,
     interference_interval=3, n_components=1,
-    local_window=0, n_frozen_heads=4,
-    use_split_step=True, device=device,
+    n_frozen_heads=4,
+    device=device,
 ).to(device)
 
 params = sum(p.numel() for p in model.parameters())

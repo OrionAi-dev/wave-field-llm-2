@@ -389,7 +389,6 @@ def main():
                 use_checkpoint=True,
                 interference_interval=3,
                 n_components=1,
-                local_window=0,
                 device=device,
                 qk_bias_diversity=cfg.get('qk_bias_diversity', False),
                 residual_scale=cfg.get('residual_scale', False),

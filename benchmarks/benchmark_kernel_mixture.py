@@ -229,14 +229,10 @@ ARCH = {
 # Standard first (set the bar), then SPECTRE baseline, then kernel mixture variants
 CONFIGS = [
     {'key': 'E', 'name': 'E) Standard Transformer', 'type': 'standard'},
-    {'key': 'A', 'name': 'A) V4.3 SPECTRE (baseline)', 'type': 'wave',
-     'use_kernel_mixture': False},
-    {'key': 'B', 'name': 'B) Kernel Mixture K=4', 'type': 'wave',
-     'use_kernel_mixture': True, 'num_basis_kernels': 4},
-    {'key': 'C', 'name': 'C) Kernel Mixture K=2', 'type': 'wave',
-     'use_kernel_mixture': True, 'num_basis_kernels': 2},
-    {'key': 'D', 'name': 'D) Kernel Mixture K=8', 'type': 'wave',
-     'use_kernel_mixture': True, 'num_basis_kernels': 8},
+    {'key': 'A', 'name': 'A) V4.3 SPECTRE (baseline)', 'type': 'wave'},
+    {'key': 'B', 'name': 'B) Kernel Mixture K=4', 'type': 'wave'},
+    {'key': 'C', 'name': 'C) Kernel Mixture K=2', 'type': 'wave'},
+    {'key': 'D', 'name': 'D) Kernel Mixture K=8', 'type': 'wave'},
 ]
 
 
@@ -375,8 +371,6 @@ def main():
                 dropout=0.1,
             ).to(device)
         else:
-            use_km = cfg.get('use_kernel_mixture', False)
-            num_bk = cfg.get('num_basis_kernels', 4)
             model = WaveFieldTransformer(
                 vocab_size=vocab_size,
                 embedding_dim=ARCH['embedding_dim'],
@@ -389,14 +383,9 @@ def main():
                 use_checkpoint=True,
                 interference_interval=3,
                 n_components=1,
-                local_window=0,
                 device=device,
                 use_analytic_kernel=True,
                 feature_map_depth=2,
-                use_write_gate=False,
-                use_3d_interference=False,
-                use_kernel_mixture=use_km,
-                num_basis_kernels=num_bk,
             ).to(device)
 
         try:

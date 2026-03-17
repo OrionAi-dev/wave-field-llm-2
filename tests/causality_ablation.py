@@ -38,7 +38,6 @@ def build_model():
         use_checkpoint=False,
         interference_interval=3,
         n_components=1,
-        local_window=0,
         device=DEVICE,
     ).to(DEVICE)
 

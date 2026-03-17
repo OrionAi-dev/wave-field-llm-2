@@ -152,13 +152,6 @@ def main():
                         eff_range = field_size
                     print(f"    C{c} w={wt:.2f} freq={w_hc:.3f} damp={a_hc:.3f} range={eff_range}")
 
-        # Show local blend if present
-        if attn.local_blend is not None:
-            blend_vals = torch.sigmoid(attn.local_blend.detach().cpu())
-            print(f"\n  Local attention blend (per head):")
-            for h in range(H):
-                b = blend_vals[h].item()
-                print(f"    H{h+1}: wave={1-b:.0%} local={b:.0%}")
 
     # ============================================================
     # 2. STATIC FIELD COUPLING (V3.4, same as V3.2)

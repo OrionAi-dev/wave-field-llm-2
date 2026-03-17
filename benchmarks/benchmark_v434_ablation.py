@@ -127,7 +127,6 @@ def create_ablation_model(vocab_size, cfg, ablation_cfg, device):
         use_checkpoint=True,
         interference_interval=3,
         n_components=1,
-        local_window=0,
         device=device,
         # Ablation knobs
         feature_map_activation=ablation_cfg['feature_map_activation'],

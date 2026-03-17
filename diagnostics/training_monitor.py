@@ -562,12 +562,9 @@ if __name__ == '__main__':
         use_checkpoint=False,
         interference_interval=3,
         n_components=1,
-        local_window=0,
         device=device,
         use_analytic_kernel=True,
         feature_map_depth=2,
-        use_write_gate=False,
-        use_3d_interference=False,
     ).to(device)
 
     params = sum(p.numel() for p in model.parameters())
