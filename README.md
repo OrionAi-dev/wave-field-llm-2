@@ -228,14 +228,25 @@ docker compose run --rm s2
 ### Local
 
 ```bash
-pip install -r requirements.txt
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install --upgrade pip
+python3 -m pip install -r requirements-dev.txt
 
-# Causality test (verifies FFT doesn't leak future tokens)
+# Causality test suite (verifies FFT doesn't leak future tokens)
+python3 -m pytest -q
+
+# Direct causality script
 python tests/test_causality.py
 
 # Smoke test (forward pass)
 python src/wave_field_transformer.py
 ```
+
+`requirements-dev.txt` installs the Torch-backed test environment used by the causality suite. If
+Torch is not installed, `pytest` skips the Torch-only causality module instead of failing during
+collection; install the dev requirements before treating local test output as proof of model
+correctness.
 
 ### Use in Your Code
 

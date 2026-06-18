@@ -24,7 +24,23 @@ import sys
 import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-import torch
+try:
+    import torch
+except ModuleNotFoundError as exc:
+    if "pytest" in sys.modules:
+        import pytest
+
+        pytest.skip(
+            "Torch is required for Wave Field causality tests. "
+            "Install the torch-backed dev environment with "
+            "`python3 -m pip install -r requirements-dev.txt`.",
+            allow_module_level=True,
+        )
+    raise ModuleNotFoundError(
+        "Torch is required for Wave Field causality tests. "
+        "Install the torch-backed dev environment with "
+        "`python3 -m pip install -r requirements-dev.txt`."
+    ) from exc
 import copy
 from src.wave_field_transformer import WaveFieldTransformer
 
